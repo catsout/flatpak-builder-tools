@@ -1214,6 +1214,17 @@ class NpmModuleProvider(ModuleProvider):
                             .version = "git+file:\($buildroot)/\($data[.version])" | .from = .version
                         else .
                         end
+                    ) | walk(
+                        if type == "object"
+                        then
+                            to_entries | map(
+                                if (.value | type == "string") and $data[.value]
+                                then .value = "git+file:\($buildroot)/\($data[.value])"
+                                else .
+                                end
+                            ) | from_entries
+                        else .
+                        end
                     )
                 ''',
             }
