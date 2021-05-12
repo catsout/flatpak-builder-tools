@@ -38,6 +38,19 @@ GIT_SCHEMES: Dict[str, Dict[str, str]] = {
     'git+http': {'scheme': 'http'},
     'git+https': {'scheme': 'https'},
 }
+GIT_URL_PATTERNS = [
+    re.compile(r'^git:'),
+    re.compile(r'^git\+.+:'),
+    re.compile(r'^ssh:'),
+    re.compile(r'^https?:.+\.git$'),
+    re.compile(r'^https?:.+\.git#.+'),
+]
+GIT_URL_HOSTS = [
+    'github.com',
+    'gitlab.com',
+    'bitbucket.com',
+    'bitbucket.org'
+]
 
 
 class Cache:
@@ -638,9 +651,8 @@ class LockfileProvider:
     def parse_git_source(self, version: str, from_: str = None) -> GitSource:
         original_url = urllib.parse.urlparse(version)
         assert original_url.scheme and original_url.path and original_url.fragment
-        assert original_url.scheme in GIT_SCHEMES, f'{version} doesn\'t match any Git prefix'
 
-        replacements = GIT_SCHEMES[original_url.scheme]
+        replacements = GIT_SCHEMES.get(original_url.scheme, {})
         new_url = original_url._replace(fragment='', **replacements)
         # Replace e.g. git:github.com/owner/repo with git://github.com/owner/repo
         if not new_url.netloc:
@@ -768,9 +780,20 @@ class SpecialSourceProvider:
             #Symlinks for @electron/get, which stores electron zips in a subdir
             if self.xdg_layout:
                 sanitized_url = ''.join(c for c in binary.url if c not in '/:')
+
+                #And for @electron/get >= 1.12.4 its sha256 hash of url dirname
+                url = urllib.parse.urlparse(binary.url)
+                url_dir = urllib.parse.urlunparse(url._replace(path=os.path.dirname(url.path)))
+                url_hash = hashlib.sha256(url_dir.encode()).hexdigest()
+
                 self.gen.add_shell_source(
-                    [f'ln -s "../{binary.filename}" "{binary.filename}"'],
-                    destination=electron_cache_dir / sanitized_url,
+                    [
+                        f'mkdir -p "{sanitized_url}"',
+                        f'ln -s "../{binary.filename}" "{sanitized_url}/{binary.filename}"',
+                        f'mkdir -p "{url_hash}"',
+                        f'ln -s "../{binary.filename}" "{url_hash}/{binary.filename}"'
+                    ],
+                    destination=electron_cache_dir,
                     only_arches=[binary.arch.flatpak])
 
         if add_integrities:
@@ -937,6 +960,38 @@ class SpecialSourceProvider:
             self.gen.add_data_source("flatpak-node-cache",
                                      destination=destdir / 'INSTALLATION_COMPLETE')
 
+    async def _handle_esbuild(self, package: Package) -> None:
+        pkg_names = {
+            'x86_64': 'esbuild-linux-64',
+            'i386': 'esbuild-linux-32',
+            'arm': 'esbuild-linux-arm',
+            'aarch64': 'esbuild-linux-arm64'
+        }
+
+        for flatpak_arch, pkg_name in pkg_names.items():
+            dl_url = f'https://registry.npmjs.org/{pkg_name}/-/{pkg_name}-{package.version}.tgz'
+            metadata = await RemoteUrlMetadata.get(dl_url, cachable=True)
+
+            cache_dst = self.gen.data_root / 'cache' / 'esbuild'
+            archive_dst = cache_dst / '.package' / f'{pkg_name}@{package.version}'
+            bin_src = archive_dst / 'bin' / 'esbuild'
+            bin_dst = cache_dst / 'bin' / f'{pkg_name}@{package.version}'
+
+            self.gen.add_archive_source(dl_url,
+                                        metadata.integrity,
+                                        destination=archive_dst,
+                                        only_arches=[flatpak_arch],
+                                        strip_components=1)
+
+            cmd = [
+                f'mkdir -p "{bin_dst.parent.relative_to(cache_dst)}"',
+                f'cp "{bin_src.relative_to(cache_dst)}" "{bin_dst.relative_to(cache_dst)}"',
+                f'ln -sf "{bin_dst.name}" "bin/esbuild-current"'
+            ]
+            self.gen.add_shell_source(cmd,
+                                      only_arches=[flatpak_arch],
+                                      destination=cache_dst)
+
     def _handle_electron_builder(self, package: Package) -> None:
         destination = self.gen.data_root / 'electron-builder-arch-args.sh'
 
@@ -976,6 +1031,8 @@ class SpecialSourceProvider:
             await self._handle_ripgrep_prebuilt(package)
         elif package.name == 'playwright':
             await self._handle_playwright(package)
+        elif package.name == 'esbuild':
+            await self._handle_esbuild(package)
 
 
 class NpmLockfileProvider(LockfileProvider):
@@ -1290,7 +1347,7 @@ class NpmModuleProvider(ModuleProvider):
             index_commands.append(f'os.chdir({str(self.cacache_dir)!r})')
 
             for parent in sorted(parents, key=len):
-                index_commands.append(f'os.mkdir({parent!r})')
+                index_commands.append(f'os.makedirs({parent!r}, exist_ok=True)')
 
             for path, entry in self.index_entries.items():
                 path = path.relative_to(self.cacache_dir)
@@ -1303,6 +1360,16 @@ class NpmModuleProvider(ModuleProvider):
 
 
 class YarnLockfileProvider(LockfileProvider):
+    @staticmethod
+    def is_git_version(version) -> bool:
+        for pattern in GIT_URL_PATTERNS:
+            if pattern.match(version):
+                return True
+        url = urllib.parse.urlparse(version)
+        if url.netloc in GIT_URL_HOSTS:
+            return len([p for p in url.path.split("/") if p]) == 2
+        return False
+
     def unquote(self, string: str) -> str:
         if string.startswith('"'):
             assert string.endswith('"')
@@ -1350,7 +1417,7 @@ class YarnLockfileProvider(LockfileProvider):
         assert version and resolved, line
 
         source: PackageSource
-        if urllib.parse.urlparse(resolved).scheme in GIT_SCHEMES:
+        if self.is_git_version(resolved):
             source = self.parse_git_source(version=resolved)
         else:
             source = ResolvedSource(resolved=resolved, integrity=integrity)
@@ -1646,6 +1713,21 @@ async def main() -> None:
         with provider_factory.create_module_provider(gen, special) as module_provider:
             with GeneratorProgress(packages, module_provider) as progress:
                 await progress.run()
+
+        if args.xdg_layout:
+            script_name = "setup_sdk_node_headers.sh"
+            node_gyp_dir = gen.data_root / "cache" / "node-gyp"
+            gen.add_script_source(
+                [   
+                    'version=$(node --version | sed "s/^v//")',
+                    'nodedir=$(dirname "$(dirname "$(which node)")")',
+                    f'mkdir -p "{node_gyp_dir}/$version"',
+                    f'ln -s "$nodedir/include" "{node_gyp_dir}/$version/include"',
+                    f'echo 9 > "{node_gyp_dir}/$version/installVersion"',
+                ],
+                destination=gen.data_root / script_name
+            )
+            gen.add_command(f"bash {gen.data_root / script_name}")
 
     if args.split:
         for i, part in enumerate(gen.split_sources()):
