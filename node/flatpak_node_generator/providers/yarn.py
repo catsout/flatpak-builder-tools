@@ -326,7 +326,9 @@ class YarnModuleProvider(ModuleProvider):
                         destination=self.mirror_locator_dir / filename,
                     )
                 else:
-                    filename = f'{self.name_base64_locator(locator, resolution)}-{source.integrity.digest[:10]}.tgz'
+                    digest_slash_index = source.integrity.digest.find('/')
+                    short_digest = source.integrity.digest[digest_slash_index+1:digest_slash_index+11]
+                    filename = f'{self.name_base64_locator(locator, resolution)}-{short_digest}.tgz'
                     resolved_source = await self.resolve_source(
                         locator, package.version
                     )
